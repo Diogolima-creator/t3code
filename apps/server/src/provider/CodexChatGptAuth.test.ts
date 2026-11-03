@@ -18,7 +18,6 @@ import * as Fiber from "effect/Fiber";
 import * as Deferred from "effect/Deferred";
 import { subscribeChatGptHandoff } from "./CodexChatGptHandoff.ts";
 import { FetchHttpClient, HttpClient, HttpClientResponse } from "effect/http";
-import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as ProviderCredentialStore from "./ProviderCredentialStore.ts";
@@ -44,9 +43,20 @@ const makeHarnessFor = Effect.fnUntraced(function* (
   const environment = ServerEnvironment.ServerEnvironmentIdentity.of({
     getEnvironmentId: Effect.succeed(environmentId),
   });
-  const keys = yield* Effect.promise(() => generateKeyPair("RS256"));
-  const jwk = yield* Effect.promise(() => exportJWK(keys.publicKey));
-  const untrustedKeys = yield* Effect.promise(() => generateKeyPair("RS256"));
+  const keys = NodeCrypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const untrustedKeys = NodeCrypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+  const publicJwk = {
+    ...keys.publicKey.export({ format: "jwk" }),
+    kid: "test",
+    alg: "RS256",
+    use: "sig",
+  };
+  const signIdToken = (claims: Record<string, unknown>, privateKey: NodeCrypto.KeyObject) => {
+    const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
+    const signingInput = `${encode({ alg: "RS256", kid: "test" })}.${encode(claims)}`;
+    const signature = NodeCrypto.sign("sha256", Buffer.from(signingInput), privateKey);
+    return `${signingInput}.${signature.toString("base64url")}`;
+  };
   const secrets = ServerSecretStore.ServerSecretStore.of({
     get: (name) => Effect.sync(() => Option.fromUndefinedOr(bytes.get(name))),
     set: (name, value) =>
@@ -99,9 +109,7 @@ const makeHarnessFor = Effect.fnUntraced(function* (
               return;
             }
             if (request.url === "/jwks") {
-              response.end(
-                JSON.stringify({ keys: [{ ...jwk, kid: "test", alg: "RS256", use: "sig" }] }),
-              );
+              response.end(JSON.stringify({ keys: [publicJwk] }));
               return;
             }
             if (request.url === "/revoke") {
@@ -167,21 +175,20 @@ const makeHarnessFor = Effect.fnUntraced(function* (
                   .digest("base64url"),
                 authorize.searchParams.get("code_challenge"),
               );
-              const token = await new SignJWT({
-                nonce: invalidNonce ? "incorrect" : authorize.searchParams.get("nonce"),
-                email,
-              })
-                .setProtectedHeader({ alg: "RS256", kid: "test" })
-                .setIssuer(identityFailure === "issuer" ? "https://untrusted-issuer.test" : origin)
-                .setAudience(
-                  identityFailure === "audience"
-                    ? "oaiapp_untrusted_audience"
-                    : body.get("client_id")!,
-                )
-                .setSubject(subject)
-                .setIssuedAt()
-                .setExpirationTime("1h")
-                .sign(identityFailure === "signature" ? untrustedKeys.privateKey : keys.privateKey);
+              const token = signIdToken(
+                {
+                  nonce: invalidNonce ? "incorrect" : authorize.searchParams.get("nonce"),
+                  email,
+                  iss: identityFailure === "issuer" ? "https://untrusted-issuer.test" : origin,
+                  aud:
+                    identityFailure === "audience"
+                      ? "oaiapp_untrusted_audience"
+                      : body.get("client_id")!,
+                  sub: subject,
+                  exp: 4_102_444_800,
+                },
+                identityFailure === "signature" ? untrustedKeys.privateKey : keys.privateKey,
+              );
               response.end(
                 JSON.stringify({
                   access_token: "initial-access",

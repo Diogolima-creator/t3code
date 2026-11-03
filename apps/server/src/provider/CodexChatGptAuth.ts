@@ -1,7 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off - OAuth loopback listener and PKCE use Node APIs.
 import * as NodeCrypto from "node:crypto";
 import * as NodeHttp from "node:http";
-import { createRemoteJWKSet, jwtVerify } from "jose";
 import {
   ProviderSetupError,
   type ChatGptReconnectProfile,
@@ -16,6 +15,9 @@ import * as AnalyticsService from "../telemetry/AnalyticsService.ts";
 import { openAiUserId } from "../telemetry/Identify.ts";
 import * as Digest from "effect/crypto/Digest";
 import * as SecureRandom from "effect/crypto/SecureRandom";
+import * as Signature from "effect/crypto/Signature";
+import * as Jwks from "effect/jose/Jwks";
+import * as Jwt from "effect/jose/Jwt";
 import * as Hex from "effect/encoding/Hex";
 import * as Exit from "effect/Exit";
 import { codexAuthCallbackPage, codexAuthReturnUrl } from "./CodexAuthCallbackPage.ts";
@@ -95,6 +97,12 @@ const Discovery = Schema.Struct({
   revocation_endpoint: Schema.optionalKey(Schema.String),
 });
 const OAuthError = Schema.Struct({ error: Schema.String });
+const IdTokenClaims = Schema.Struct({
+  sub: Schema.String,
+  nonce: Schema.optionalKey(Schema.Unknown),
+  email: Schema.optionalKey(Schema.Unknown),
+});
+const decodeKeySet = Schema.decodeUnknownEffect(Jwks.KeySet);
 const decodeSessions = Schema.decodeUnknownEffect(
   Schema.fromJsonString(Schema.Union([Sessions, Record])),
 );
@@ -165,6 +173,7 @@ export const makeCodexChatGptAuth = Effect.fn("makeCodexChatGptAuth")(function* 
   const secrets = yield* ServerSecretStore.ServerSecretStore;
   const random = yield* SecureRandom.SecureRandom;
   const digest = yield* Digest.Digest;
+  const signature = yield* Signature.Signature;
   const environmentLocks = sessionLocks.get(secrets) ?? new Map<string, Semaphore.Semaphore>();
   sessionLocks.set(secrets, environmentLocks);
   const lock = environmentLocks.get(store.binding.key) ?? (yield* Semaphore.make(1));
@@ -177,7 +186,6 @@ export const makeCodexChatGptAuth = Effect.fn("makeCodexChatGptAuth")(function* 
   const failure = (operation: string, detail: string) =>
     new ProviderSetupError({ instanceId: options.instanceId, operation, detail });
   let metadata: typeof Discovery.Type | undefined;
-  let jwks: ReturnType<typeof createRemoteJWKSet> | undefined;
   const discover = Effect.gen(function* () {
     if (metadata) return metadata;
     const result = yield* http.get(options.discoveryUrl ?? DISCOVERY).pipe(
@@ -203,9 +211,29 @@ export const makeCodexChatGptAuth = Effect.fn("makeCodexChatGptAuth")(function* 
     )
       return yield* failure("discover", "ChatGPT sign-in configuration could not be verified.");
     metadata = result;
-    jwks = createRemoteJWKSet(new URL(result.jwks_uri));
     return result;
   });
+  const verifyIdToken = Effect.fn("CodexChatGptAuth.verifyIdToken")(
+    function* (token: string, audience: string) {
+      const endpoints = yield* discover;
+      const keySet = yield* http.get(endpoints.jwks_uri).pipe(
+        Effect.filterOrFail(
+          (response) => response.status === 200,
+          () => failure("verify", "Could not reach ChatGPT sign-in. Try again."),
+        ),
+        Effect.flatMap((response) => response.json),
+        Effect.flatMap(decodeKeySet),
+      );
+      return yield* Jwt.verifyWithKeySet(IdTokenClaims, token, {
+        issuer: endpoints.issuer,
+        audience,
+        algorithms: ["RS256", "ES256"],
+        clockTolerance: "5 seconds",
+        requiredClaims: ["exp"],
+      }).pipe(Effect.provideService(Jwks.Jwks, yield* Jwks.makeLocal(keySet)));
+    },
+    Effect.provideService(Signature.Signature, signature),
+  );
   const readSessions = store.get.pipe(
     Effect.mapError(() => failure("read", "Could not read the saved ChatGPT connection.")),
     Effect.flatMap((bytes) =>
@@ -622,22 +650,19 @@ export const makeCodexChatGptAuth = Effect.fn("makeCodexChatGptAuth")(function* 
           "verify",
           "ChatGPT did not return a verified identity. Sign in again.",
         );
-      const identity = yield* Effect.tryPromise({
-        try: async () => {
-          const { payload } = await jwtVerify(tokens.id_token!, jwks!, {
-            issuer: endpoints.issuer,
-            audience: clientId,
-            algorithms: ["RS256", "ES256"],
-            clockTolerance: 5,
-          });
-          if (payload.nonce !== nonce || !payload.sub || !payload.exp) throw new Error("identity");
-          return {
-            subject: payload.sub,
-            email: typeof payload.email === "string" ? payload.email : null,
-          };
-        },
-        catch: () => failure("verify", "ChatGPT sign-in could not be verified. Start again."),
-      });
+      const identity = yield* verifyIdToken(tokens.id_token, clientId).pipe(
+        Effect.flatMap(({ claims }) =>
+          claims.nonce === nonce
+            ? Effect.succeed({
+                subject: claims.sub,
+                email: typeof claims.email === "string" ? claims.email : null,
+              })
+            : Effect.fail(failure("verify", "identity")),
+        ),
+        Effect.mapError(() =>
+          failure("verify", "ChatGPT sign-in could not be verified. Start again."),
+        ),
+      );
       const expectedSubject =
         savedRegistration?.subject ??
         (previous?.clientId === registeredClientId ? previous?.subject : undefined);
@@ -951,20 +976,15 @@ export const makeCodexChatGptAuth = Effect.fn("makeCodexChatGptAuth")(function* 
           "import",
           "The transferred ChatGPT connection is invalid or expired.",
         );
-      const identity = yield* Effect.tryPromise({
-        try: () =>
-          jwtVerify(credentials.idToken, jwks!, {
-            issuer: endpoints.issuer,
-            audience: credentials.clientId,
-            algorithms: ["RS256", "ES256"],
-            clockTolerance: 5,
-          }),
-        catch: () => failure("import", "The transferred ChatGPT identity could not be verified."),
-      });
+      const identity = yield* verifyIdToken(credentials.idToken, credentials.clientId).pipe(
+        Effect.mapError(() =>
+          failure("import", "The transferred ChatGPT identity could not be verified."),
+        ),
+      );
       if (
-        identity.payload.sub !== credentials.subject ||
+        identity.claims.sub !== credentials.subject ||
         profile.registration.subject !== credentials.subject ||
-        (identity.payload.email ?? null) !== credentials.email ||
+        (identity.claims.email ?? null) !== credentials.email ||
         (profile.registration.email !== undefined &&
           profile.registration.email !== credentials.email)
       )
