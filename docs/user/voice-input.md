@@ -114,3 +114,15 @@ error instead of switching to CPU.
 **Model unload** defaults to 15 minutes of inactivity on the selected environment.
 Choose Never to keep the model ready until the environment stops, or Immediately
 to release its memory after each transcription.
+
+### GPU acceleration on Linux
+
+The bundled Linux runtime uses Vulkan for GPU acceleration. Install a working
+Vulkan loader and your GPU vendor's Vulkan driver on the transcription
+environment, including when you dictate from another device. Restart that
+environment after installing or updating drivers so it can discover the GPU.
+
+Use **Test model** to check transcription with **Auto** or your selected GPU.
+The first GPU transcription can take longer while the driver prepares shaders.
+If no GPU is available, **Auto** uses the CPU. Choose **CPU** to keep dictating
+while troubleshooting a selected GPU that is unavailable or fails to load.
