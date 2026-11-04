@@ -1,5 +1,9 @@
+import { importRelayPrivateKey, signRelayJwt, type RelayJwtError } from "@t3tools/shared/relayJwt";
+import * as Context from "effect/Context";
+import * as Signature from "effect/crypto/Signature";
 import * as Effect from "effect/Effect";
 import * as Jwk from "effect/jose/Jwk";
+import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
@@ -109,3 +113,35 @@ export const getOrCreateEnvironmentKeyPairFromSecretStore = Effect.fn(function* 
   );
   return yield* persistEnvironmentKeyPair(secrets, keyPair);
 });
+
+/** The environment's Ed25519 relay signing key, loaded and parsed once at startup. */
+export class EnvironmentSigningKey extends Context.Service<
+  EnvironmentSigningKey,
+  {
+    /** SPKI PEM, as relays and linked clients receive it. */
+    readonly publicKey: string;
+    readonly sign: (input: {
+      readonly typ: string;
+      readonly payload: Readonly<Record<string, unknown>>;
+    }) => Effect.Effect<string, RelayJwtError>;
+  }
+>()("t3/cloud/environmentKeys/EnvironmentSigningKey") {}
+
+export const layer = Layer.effect(
+  EnvironmentSigningKey,
+  Effect.gen(function* () {
+    const secrets = yield* ServerSecretStore.ServerSecretStore;
+    const signature = yield* Signature.Signature;
+    const keyPair = yield* getOrCreateEnvironmentKeyPairFromSecretStore(secrets);
+    // The key was generated and stored by this server, so a parse failure is corruption.
+    const privateKey = yield* importRelayPrivateKey(keyPair.privateKey).pipe(Effect.orDie);
+    return EnvironmentSigningKey.of({
+      publicKey: keyPair.publicKey,
+      sign: Effect.fn("EnvironmentSigningKey.sign")(function* (input) {
+        return yield* signRelayJwt({ ...input, privateKey }).pipe(
+          Effect.provideService(Signature.Signature, signature),
+        );
+      }),
+    });
+  }),
+);
